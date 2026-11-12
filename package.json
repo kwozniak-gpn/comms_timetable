@@ -1,0 +1,16 @@
+{
+  "name": "comms_timetable",
+  "version": "1.0.0",
+  "description": "3rd comms teammate — replaces Hannah's Apps Script weekly-tab trigger and adds a 3-state status layer to the VC & GRN Weekly OA & NL Timetable sheet.",
+  "main": "jobs/weekly-setup.js",
+  "scripts": {
+    "test": "echo \"no tests yet\" && exit 0"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "dotenv": "^17.4.2"
+  }
+}
