@@ -128,6 +128,16 @@ function findSourceRow(rows, source, targetIso) {
   return rows.find((r) => toIsoDate(r.values[dateColIdx]) === targetIso) || null;
 }
 
+// Hannah's ask via Kasia, 13 Nov 2026: surface the real Bloomreach scenario link
+// directly in the timetable, in the row that used to be "Submission deadline" (dead
+// weight from the old workflow — nothing read or wrote it). Same scenarioLink value
+// deriveStatus() already reads for the 🔓 check, just exposed separately so main() can
+// write it regardless of which Status emoji that row ends up with.
+function getScenarioLink(source, row) {
+  if (!row) return '';
+  return row.values[source.cols.scenarioLink - 1] || '';
+}
+
 function deriveStatus(source, row) {
   if (!row) return null; // nothing to report yet — not an error, just not started
   const stateVal = row.values[(source.cols.state || source.cols.status) - 1] || '';
@@ -214,6 +224,21 @@ async function main() {
           marker.cells[markerKey] = { emoji: status.emoji };
           markerDirty = true;
         }
+
+        // Hannah's ask via Kasia, 13 Nov 2026: surface the real Bloomreach scenario
+        // link in the "BR Link" row (replaces the old, unused "Submission deadline").
+        // Only writes when a real link exists — never clears a previously-captured
+        // link on a later poll that happens to read a blank value.
+        const brLinkField = block.fields['BR Link'];
+        const scenarioLink = getScenarioLink(source, row);
+        if (brLinkField && scenarioLink) {
+          const brRange = `${sheets.quoteSheetTitle(tabName)}!${sheets.colLetter(colIndex + 1)}${brLinkField.rowNumber}`;
+          const existingBr = brLinkField.cells[colIndex]?.hyperlink;
+          if (existingBr !== scenarioLink) {
+            await sheets.writeRange(TIMETABLE_SPREADSHEET_ID, brRange, [[`=HYPERLINK("${scenarioLink}","Open")`]], { valueInputOption: 'USER_ENTERED' });
+            console.log(`  ${tabName} ${code} (${block.dayName}) BR Link -> ${scenarioLink}`);
+          }
+        }
       }
     }
 
@@ -223,7 +248,7 @@ async function main() {
   console.log('status-poller: done.');
 }
 
-module.exports = { main, deriveStatus, findSourceRow, toIsoDate, sendDateCellToIso, findCurrentOrFutureGrnTabs };
+module.exports = { main, deriveStatus, getScenarioLink, findSourceRow, toIsoDate, sendDateCellToIso, findCurrentOrFutureGrnTabs };
 
 if (require.main === module) {
   main().catch(async (err) => {
