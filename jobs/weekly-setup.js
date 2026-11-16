@@ -11,7 +11,7 @@ require('dotenv').config();
 const sheets = require('../lib/sheets_rest');
 const { getAccessToken } = require('../lib/gcp_access_token');
 const { parseDayBlocks, countryColumns, resolveCountryCode } = require('../lib/timetable_parser');
-const { getSendDateForCountry } = require('../lib/bf_cm_overrides');
+const { GRN_BUILD_SCHEDULE, applyBfCmOverride } = require('../lib/bf_cm_overrides');
 const { VC_RECURRING_SENDS } = require('../lib/vc_template');
 
 const TIMETABLE_SPREADSHEET_ID = process.env.TIMETABLE_SPREADSHEET_ID || '1Js1-99MwrN-klxlh23FIzgZSLUhyxQEz62AyBd2HzPw';
@@ -73,37 +73,61 @@ async function ensureWeekTab(templateName, weekDateSuffix) {
   return { title: newTitle, created: true };
 }
 
-// Remaps every day-block's date (col B of the day-row) to the real target week.
-// Blocks in the template are already consecutive calendar days, in order (verified
-// against real data) — anchor whichever block is labeled "Monday" to the real target
-// Monday, then every other block = anchor + (its own position offset from that block).
+const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+// Each block's real date is its own weekday's distance from the target Monday (0-6),
+// independent of the block's row position. This matters because VC's blocks are NOT
+// simple consecutive-forward days: its trailing "Monday" block (Rewards/IE Rewards,
+// confirmed real content in both GRN 09.11.26 and this week) sits at the BOTTOM of the
+// row order but belongs to the SAME week's Monday, not the next one — verified against
+// VC 09.11.26 where that block is dated 09/11/2026, matching that week's own Monday, not
+// 16/11/2026. A position-based "anchor block 0, then +1 per row" scheme gets this one
+// wrong by a full week. GRN's blocks happen to already run Monday->Friday in row order,
+// so this formula reduces to the same dates there.
+function dayOffsetFromMonday(dayName) {
+  const idx = DAY_NAMES.indexOf(dayName);
+  if (idx === -1) throw new Error(`dayOffsetFromMonday: unrecognized day name "${dayName}"`);
+  return (idx - 1 + 7) % 7; // Monday(1) -> 0, Tuesday(2) -> 1, ... Sunday(0) -> 6
+}
+
+// Remaps every day-block's date (col B of the day-row) to the real target week, each
+// computed independently from the block's own day name (see dayOffsetFromMonday).
 async function remapBlockDates(tabName, targetMonday) {
   const rowData = await fetchGrid(tabName);
   const blocks = parseDayBlocks(rowData);
-  const mondayIdx = blocks.findIndex((b) => b.dayName === 'Monday');
-  if (mondayIdx === -1) throw new Error(`remapBlockDates: no "Monday" block found in ${tabName} — can't anchor the week`);
+  if (blocks.length === 0) throw new Error(`remapBlockDates: no day blocks found in ${tabName}`);
 
-  for (let i = 0; i < blocks.length; i++) {
-    const offsetDays = i - mondayIdx;
-    const date = new Date(targetMonday);
-    date.setUTCDate(date.getUTCDate() + offsetDays);
-    const range = `${sheets.quoteSheetTitle(tabName)}!B${blocks[i].dayRowNumber}`;
+  const blockDate = (dayName) => {
+    const d = new Date(targetMonday);
+    d.setUTCDate(d.getUTCDate() + dayOffsetFromMonday(dayName));
+    return d;
+  };
+
+  for (const block of blocks) {
+    const date = blockDate(block.dayName);
+    const range = `${sheets.quoteSheetTitle(tabName)}!B${block.dayRowNumber}`;
     await sheets.writeRange(TIMETABLE_SPREADSHEET_ID, range, [[blockDateCell(date)]]);
-    console.log(`    ${tabName} row ${blocks[i].dayRowNumber} (${blocks[i].dayName}) -> ${blockDateCell(date)}`);
+    console.log(`    ${tabName} row ${block.dayRowNumber} (${block.dayName}) -> ${blockDateCell(date)}`);
   }
+  // Week Commencing Date cell (row 2) always reflects the tab's own first block date —
+  // matches the existing human convention (GRN's is the real Monday; VC's is its own
+  // first block, Tuesday).
+  const wcDate = blockDate(blocks[0].dayName);
+  await sheets.writeRange(TIMETABLE_SPREADSHEET_ID, `${sheets.quoteSheetTitle(tabName)}!B2`, [[blockDateCell(wcDate)]]);
+  console.log(`    ${tabName} Week Commencing Date -> ${blockDateCell(wcDate)}`);
+
   // Return the blocks re-annotated with their real build dates for the caller.
-  return blocks.map((b, i) => {
-    const date = new Date(targetMonday);
-    date.setUTCDate(date.getUTCDate() + (i - mondayIdx));
+  return blocks.map((b) => {
+    const date = blockDate(b.dayName);
     return { ...b, buildDateIso: date.toISOString().slice(0, 10) };
   });
 }
 
-// GRN only: for each block, for each country column, compute the real upcoming Send
-// date via getSendDateForCountry(countryCode, buildDate). Repeated country codes within
-// the SAME block (NA CO/NA CW staging several upcoming sends in one block, confirmed in
-// real live data) advance a per-code cursor so each repeat gets the NEXT date after the
-// previous one, not the same date three times.
+// GRN only: for each block, for each country column, compute the real Send date from
+// GRN_BUILD_SCHEDULE's fixed day-offset for that (build day, column position) — see the
+// table's own comment for why this can't be a generic "next occurrence of the country's
+// weekly send day" scan. Matched by column position against the schedule, not by country
+// code lookup, since NA CO repeats multiple times per block with different offsets.
 async function prefillGrnSendDates(tabName, blocks) {
   for (const block of blocks) {
     const sendDateField = block.fields['Send date'];
@@ -111,25 +135,23 @@ async function prefillGrnSendDates(tabName, blocks) {
       console.warn(`    (!) ${tabName} block ${block.dayName} has no "Send date" row — skipping`);
       continue;
     }
+    const schedule = GRN_BUILD_SCHEDULE[block.dayName];
+    if (!schedule) {
+      console.warn(`    (!) ${tabName} block ${block.dayName}: no GRN_BUILD_SCHEDULE entry — skipping`);
+      continue;
+    }
     const cols = countryColumns(block);
-    const cursor = {}; // countryCode -> last-used date ISO, to advance repeats
-    for (const { code: rawCode, colIndex } of cols) {
+    for (let i = 0; i < cols.length; i++) {
+      const { code: rawCode, colIndex } = cols[i];
       const code = resolveCountryCode(rawCode, block.dayName);
-      if (rawCode === 'NA') console.log(`    (resolved bare "NA" -> "${code}" for ${block.dayName} block, col ${colIndex + 1})`);
-      let fromDate = block.buildDateIso;
-      if (cursor[code]) {
-        const d = new Date(`${cursor[code]}T00:00:00Z`);
-        d.setUTCDate(d.getUTCDate() + 1);
-        fromDate = d.toISOString().slice(0, 10);
-      }
-      let result;
-      try {
-        result = getSendDateForCountry(code, new Date(`${fromDate}T00:00:00Z`));
-      } catch (err) {
-        console.warn(`    (!) ${tabName} block ${block.dayName} col ${colIndex + 1}: ${err.message}`);
+      const entry = schedule[i];
+      if (!entry || entry.country !== code) {
+        console.warn(`    (!) ${tabName} block ${block.dayName} col ${colIndex + 1}: expected "${entry && entry.country}" at position ${i}, found "${code}" — skipping (Country row doesn't match GRN_BUILD_SCHEDULE's expected order)`);
         continue;
       }
-      cursor[code] = result.dateIso;
+      const d = new Date(`${block.buildDateIso}T00:00:00Z`);
+      d.setUTCDate(d.getUTCDate() + entry.offsetDays);
+      const result = applyBfCmOverride(code, d.toISOString().slice(0, 10));
       const cellText = `${result.day}: ${sendDateSuffix(result.dateIso)}`;
       const range = `${sheets.quoteSheetTitle(tabName)}!${sheets.colLetter(colIndex + 1)}${sendDateField.rowNumber}`;
       // Never overwrite an already-filled Send date (a human may have corrected it,

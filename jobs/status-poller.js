@@ -138,6 +138,14 @@ function getScenarioLink(source, row) {
   return row.values[source.cols.scenarioLink - 1] || '';
 }
 
+// "Pending" means queued/not started yet — the build genuinely hasn't happened, so it
+// must show no status at all, same as no row existing yet. Confirmed 16 Nov 2026 (Kasia):
+// UK's 20/11 send showed "📝 In progress" a full day before its Tuesday build even
+// started, because the old fallback treated ANY non-empty state as "In progress".
+function isNotStartedState(stateVal) {
+  return /^pending$/i.test(stateVal.trim());
+}
+
 function deriveStatus(source, row) {
   if (!row) return null; // nothing to report yet — not an error, just not started
   const stateVal = row.values[(source.cols.state || source.cols.status) - 1] || '';
@@ -150,7 +158,7 @@ function deriveStatus(source, row) {
   for (const { re, label } of NOTES_FLAG_PATTERNS) {
     if (re.test(notesVal)) return { emoji: '🚨', label };
   }
-  if (stateVal) return { emoji: '📝', label: 'In progress' };
+  if (stateVal && !isNotStartedState(stateVal)) return { emoji: '📝', label: 'In progress' };
   return null;
 }
 
@@ -248,7 +256,7 @@ async function main() {
   console.log('status-poller: done.');
 }
 
-module.exports = { main, deriveStatus, getScenarioLink, findSourceRow, toIsoDate, sendDateCellToIso, findCurrentOrFutureGrnTabs };
+module.exports = { main, deriveStatus, isNotStartedState, getScenarioLink, findSourceRow, toIsoDate, sendDateCellToIso, findCurrentOrFutureGrnTabs };
 
 if (require.main === module) {
   main().catch(async (err) => {
