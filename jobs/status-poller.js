@@ -151,12 +151,24 @@ function deriveStatus(source, row) {
   const stateVal = row.values[(source.cols.state || source.cols.status) - 1] || '';
   const notesVal = row.values[source.cols.notes - 1] || '';
   const scenarioLink = row.values[source.cols.scenarioLink - 1] || '';
+  const locked = isLockedState(source, stateVal);
 
-  if (isLockedState(source, stateVal) && scenarioLink) {
+  if (locked && scenarioLink) {
     return { emoji: '🔓', label: 'Scenario in Bloomreach' };
   }
-  for (const { re, label } of NOTES_FLAG_PATTERNS) {
-    if (re.test(notesVal)) return { emoji: '🚨', label };
+  // Real incident, 17 Nov 2026: Notes columns on every source sheet only ever append,
+  // never clear — a one-off "add not applied" or "DEFECT REPORT" entry from hours earlier
+  // stays in that cell's text forever, even after a later entry in the same string shows
+  // the issue was actually fixed. Checking NOTES_FLAG_PATTERNS unconditionally meant a
+  // send that was already approved and locked (UK's 19/11 and 20/11, NA CO's 19/11) kept
+  // showing a stale 🚨 for an issue a human had already resolved. A locked/approved send
+  // means a human has already signed off - by definition there is no longer an open
+  // blocker to flag, whatever old text happens to sit in Notes. Only check for a new 🚨
+  // while the send is still genuinely in flight (not yet locked).
+  if (!locked) {
+    for (const { re, label } of NOTES_FLAG_PATTERNS) {
+      if (re.test(notesVal)) return { emoji: '🚨', label };
+    }
   }
   if (stateVal && !isNotStartedState(stateVal)) return { emoji: '📝', label: 'In progress' };
   return null;
