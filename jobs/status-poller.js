@@ -16,29 +16,60 @@ const { readMarker, writeMarker } = require('../lib/gcs_marker_rest');
 const TIMETABLE_SPREADSHEET_ID = process.env.TIMETABLE_SPREADSHEET_ID || '1Js1-99MwrN-klxlh23FIzgZSLUhyxQEz62AyBd2HzPw';
 const MARKER_BUCKET = process.env.COMMS_TIMETABLE_GCS_BUCKET || `${process.env.GCP_PROJECT || 'prj-grp-couponscrm-prod-46a9'}-comms-timetable-state`;
 
-// Every ROW + UAE country shares NA's own Sends-tab schema (confirmed verbatim-copied
-// in row_newsletter_automation/lib/sends_tab_rest.js). UK's Dates tab is a different,
-// simpler shape (confirmed in uk_newsletter_automation/lib/dates_tab_rest.js).
-const ROW_SENDS_COLS = { date: 1, state: 4, notes: 12, scenarioLink: 15 };
-const UK_DATES_COLS = { sendDate: 2, status: 5, notes: 7, scenarioLink: 13 };
+// REWRITTEN 18 Nov 2026 — these used to be hardcoded column NUMBERS (`date: 1, state: 4,
+// notes: 12, scenarioLink: 15`), copied by hand from each repo's schema at build time.
+// That's exactly the fragility class Kasia flagged the same day: this file has zero
+// ownership of na_/uk_/row_newsletter_automation's own tracking-sheet schemas, so a
+// hardcoded position silently drifts the moment any of those three repos adds or
+// reorders a column — which happened literally the same day (Subject Chars/Preheader
+// Chars columns added to all three). It happened to land after every position this file
+// already depended on, so nothing broke this time — but that was luck, not design.
+// Columns are now resolved by HEADER TEXT, read fresh from each sheet's own row 1 every
+// run (cached per spreadsheet+tab for the run's duration) — the same "never write/read by
+// a remembered position" discipline this file already applies to the Timetable sheet
+// itself (see project_comms_status_dashboard_design memory's "Matching discipline"
+// section), now applied to the sheets it reads FROM too, not just the one it writes to.
+const ROW_SENDS_LABELS = { date: 'Date', state: 'State', notes: 'Notes', scenarioLink: 'Scenario Link' };
+const UK_DATES_LABELS = { sendDate: 'Send Date', status: 'Status', notes: 'Notes', scenarioLink: 'Scenario Link' };
 
 // Real current spreadsheet IDs — UK Dates tab + NA Sends tab from project memory, every
 // ROW+UAE country from row_newsletter_automation/lib/country_config.js's own
 // NEW_SENDS_SHEET_ID map (the authoritative, current source).
 const SOURCES = {
-  UK: { spreadsheetId: '1Q6Pl3Z3KVJBfX4HPBElZ7ENDybC5kWS9YhwKFMeBLTU', tab: 'Dates', cols: UK_DATES_COLS, kind: 'uk' },
-  'NA CO': { spreadsheetId: '1nRf73lrKp-8WuyIjiwwSde_9hvdVzxsQYxPrXAaurNI', tab: 'Sends', cols: ROW_SENDS_COLS, kind: 'row' },
-  'NA CW': { spreadsheetId: '1nRf73lrKp-8WuyIjiwwSde_9hvdVzxsQYxPrXAaurNI', tab: 'Sends', cols: ROW_SENDS_COLS, kind: 'row' },
-  AU: { spreadsheetId: '1dl1TIfEBvsH6r3UHQkBWECJSXaK8N7crz9nZLqUv0mU', tab: 'Sends', cols: ROW_SENDS_COLS, kind: 'row' },
-  DE: { spreadsheetId: '1P8gHeB1O6ICz1hy12-0z0AEZE71JjPAwb8v6cJH1Zb0', tab: 'Sends', cols: ROW_SENDS_COLS, kind: 'row' },
-  FR: { spreadsheetId: '1p66TnNUpkAeCW1aN--SVN8FbRecSJ2i8ZwiF-Wvb-S8', tab: 'Sends', cols: ROW_SENDS_COLS, kind: 'row' },
-  IE: { spreadsheetId: '1ajxWFWEvJf_iEsDVMCCg8lwAzZR_hnm-nwNNXZjBeTA', tab: 'Sends', cols: ROW_SENDS_COLS, kind: 'row' },
-  IT: { spreadsheetId: '1i1vUoMGyDs0CpNNykzAd-cWPo2NMCj4o2Wb-SCWC9uk', tab: 'Sends', cols: ROW_SENDS_COLS, kind: 'row' },
-  NL: { spreadsheetId: '1DAdZrnFmbCmyHsZn-O3SOZJZ7E314SJOl7YBgM47eS0', tab: 'Sends', cols: ROW_SENDS_COLS, kind: 'row' },
-  PL: { spreadsheetId: '1SD78TigKLJOjl9t3ZKdMApu9M5UZNP4ft0tYlKYQTOA', tab: 'Sends', cols: ROW_SENDS_COLS, kind: 'row' },
-  ES: { spreadsheetId: '1HLuLXVU5u0LAhJ8TI1a56FBCKcef2shNLnjRPY0Z3Q4', tab: 'Sends', cols: ROW_SENDS_COLS, kind: 'row' },
-  UAE: { spreadsheetId: '1nOqLoUcaf9BpcybrSk9oooCSCjo0QUrX2ciBO0X4qD0', tab: 'Sends', cols: ROW_SENDS_COLS, kind: 'row' },
+  UK: { spreadsheetId: '1Q6Pl3Z3KVJBfX4HPBElZ7ENDybC5kWS9YhwKFMeBLTU', tab: 'Dates', labels: UK_DATES_LABELS, kind: 'uk' },
+  'NA CO': { spreadsheetId: '1nRf73lrKp-8WuyIjiwwSde_9hvdVzxsQYxPrXAaurNI', tab: 'Sends', labels: ROW_SENDS_LABELS, kind: 'row' },
+  'NA CW': { spreadsheetId: '1nRf73lrKp-8WuyIjiwwSde_9hvdVzxsQYxPrXAaurNI', tab: 'Sends', labels: ROW_SENDS_LABELS, kind: 'row' },
+  AU: { spreadsheetId: '1dl1TIfEBvsH6r3UHQkBWECJSXaK8N7crz9nZLqUv0mU', tab: 'Sends', labels: ROW_SENDS_LABELS, kind: 'row' },
+  DE: { spreadsheetId: '1P8gHeB1O6ICz1hy12-0z0AEZE71JjPAwb8v6cJH1Zb0', tab: 'Sends', labels: ROW_SENDS_LABELS, kind: 'row' },
+  FR: { spreadsheetId: '1p66TnNUpkAeCW1aN--SVN8FbRecSJ2i8ZwiF-Wvb-S8', tab: 'Sends', labels: ROW_SENDS_LABELS, kind: 'row' },
+  IE: { spreadsheetId: '1ajxWFWEvJf_iEsDVMCCg8lwAzZR_hnm-nwNNXZjBeTA', tab: 'Sends', labels: ROW_SENDS_LABELS, kind: 'row' },
+  IT: { spreadsheetId: '1i1vUoMGyDs0CpNNykzAd-cWPo2NMCj4o2Wb-SCWC9uk', tab: 'Sends', labels: ROW_SENDS_LABELS, kind: 'row' },
+  NL: { spreadsheetId: '1DAdZrnFmbCmyHsZn-O3SOZJZ7E314SJOl7YBgM47eS0', tab: 'Sends', labels: ROW_SENDS_LABELS, kind: 'row' },
+  PL: { spreadsheetId: '1SD78TigKLJOjl9t3ZKdMApu9M5UZNP4ft0tYlKYQTOA', tab: 'Sends', labels: ROW_SENDS_LABELS, kind: 'row' },
+  ES: { spreadsheetId: '1HLuLXVU5u0LAhJ8TI1a56FBCKcef2shNLnjRPY0Z3Q4', tab: 'Sends', labels: ROW_SENDS_LABELS, kind: 'row' },
+  UAE: { spreadsheetId: '1nOqLoUcaf9BpcybrSk9oooCSCjo0QUrX2ciBO0X4qD0', tab: 'Sends', labels: ROW_SENDS_LABELS, kind: 'row' },
 };
+
+// Reads row 1 of a source sheet once, resolves every label in source.labels to its real
+// current column number. Throws (loudly — same "flag, never silently skip" rule this
+// file already follows for everything else) if a label can't be found, since a missing
+// header means this file's whole model of that sheet is now wrong, not just one field.
+const _colsCache = new Map(); // `${spreadsheetId}:${tab}` -> resolved cols object
+async function resolveCols(source) {
+  const cacheKey = `${source.spreadsheetId}:${source.tab}`;
+  if (_colsCache.has(cacheKey)) return _colsCache.get(cacheKey);
+  const headerRow = (await sheets.readRange(source.spreadsheetId, `${source.tab}!A1:Z1`))[0] || [];
+  const cols = {};
+  for (const [key, label] of Object.entries(source.labels)) {
+    const idx = headerRow.findIndex((h) => (h || '').trim() === label);
+    if (idx === -1) {
+      throw new Error(`column "${label}" not found in ${source.tab} tab header row (looked for key "${key}")`);
+    }
+    cols[key] = idx + 1; // 1-indexed, matching every other column-number convention in this file
+  }
+  _colsCache.set(cacheKey, cols);
+  return cols;
+}
 
 // Kasia's explicit spec: terse, no narrative, no quoted detail — 2-3 words, period.
 const NOTES_FLAG_PATTERNS = [
@@ -112,10 +143,10 @@ async function findCurrentOrFutureGrnTabs() {
 }
 
 const _sendsCache = new Map(); // `${spreadsheetId}:${tab}` -> rows (fetched once per run)
-async function readSendsRows(source) {
+async function readSendsRows(source, cols) {
   const cacheKey = `${source.spreadsheetId}:${source.tab}`;
   if (_sendsCache.has(cacheKey)) return _sendsCache.get(cacheKey);
-  const colCount = Math.max(...Object.values(source.cols));
+  const colCount = Math.max(...Object.values(cols));
   const range = `${source.tab}!A2:${sheets.colLetter(colCount)}5000`;
   const raw = await sheets.readRange(source.spreadsheetId, range);
   const rows = raw.filter((r) => r && r[0]).map((r, i) => ({ rowNumber: i + 2, values: r }));
@@ -123,8 +154,8 @@ async function readSendsRows(source) {
   return rows;
 }
 
-function findSourceRow(rows, source, targetIso) {
-  const dateColIdx = (source.cols.date || source.cols.sendDate) - 1;
+function findSourceRow(rows, cols, targetIso) {
+  const dateColIdx = (cols.date || cols.sendDate) - 1;
   return rows.find((r) => toIsoDate(r.values[dateColIdx]) === targetIso) || null;
 }
 
@@ -133,9 +164,9 @@ function findSourceRow(rows, source, targetIso) {
 // weight from the old workflow — nothing read or wrote it). Same scenarioLink value
 // deriveStatus() already reads for the 🔓 check, just exposed separately so main() can
 // write it regardless of which Status emoji that row ends up with.
-function getScenarioLink(source, row) {
+function getScenarioLink(cols, row) {
   if (!row) return '';
-  return row.values[source.cols.scenarioLink - 1] || '';
+  return row.values[cols.scenarioLink - 1] || '';
 }
 
 // "Pending" means queued/not started yet — the build genuinely hasn't happened, so it
@@ -146,11 +177,11 @@ function isNotStartedState(stateVal) {
   return /^pending$/i.test(stateVal.trim());
 }
 
-function deriveStatus(source, row) {
+function deriveStatus(source, cols, row) {
   if (!row) return null; // nothing to report yet — not an error, just not started
-  const stateVal = row.values[(source.cols.state || source.cols.status) - 1] || '';
-  const notesVal = row.values[source.cols.notes - 1] || '';
-  const scenarioLink = row.values[source.cols.scenarioLink - 1] || '';
+  const stateVal = row.values[(cols.state || cols.status) - 1] || '';
+  const notesVal = row.values[cols.notes - 1] || '';
+  const scenarioLink = row.values[cols.scenarioLink - 1] || '';
   const locked = isLockedState(source, stateVal);
 
   if (locked && scenarioLink) {
@@ -212,16 +243,17 @@ async function main() {
         const targetIso = sendDateCellToIso(sendDateCell);
         if (!targetIso) continue; // Send date not filled in yet — nothing to check
 
-        let rows;
+        let rows, sourceCols;
         try {
-          rows = await readSendsRows(source);
+          sourceCols = await resolveCols(source);
+          rows = await readSendsRows(source, sourceCols);
         } catch (err) {
           await postChatError(`Sends sheet unreadable — ${code}`);
           console.error(err);
           continue;
         }
-        const row = findSourceRow(rows, source, targetIso);
-        const status = deriveStatus(source, row);
+        const row = findSourceRow(rows, sourceCols, targetIso);
+        const status = deriveStatus(source, sourceCols, row);
 
         const markerKey = `${block.dayName}:${colIndex}`;
         const prevEmoji = marker.cells[markerKey]?.emoji;
@@ -250,7 +282,7 @@ async function main() {
         // Only writes when a real link exists — never clears a previously-captured
         // link on a later poll that happens to read a blank value.
         const brLinkField = block.fields['BR Link'];
-        const scenarioLink = getScenarioLink(source, row);
+        const scenarioLink = getScenarioLink(sourceCols, row);
         if (brLinkField && scenarioLink) {
           const brRange = `${sheets.quoteSheetTitle(tabName)}!${sheets.colLetter(colIndex + 1)}${brLinkField.rowNumber}`;
           const existingBr = brLinkField.cells[colIndex]?.hyperlink;
@@ -268,7 +300,7 @@ async function main() {
   console.log('status-poller: done.');
 }
 
-module.exports = { main, deriveStatus, isNotStartedState, getScenarioLink, findSourceRow, toIsoDate, sendDateCellToIso, findCurrentOrFutureGrnTabs };
+module.exports = { main, deriveStatus, isNotStartedState, getScenarioLink, findSourceRow, resolveCols, toIsoDate, sendDateCellToIso, findCurrentOrFutureGrnTabs };
 
 if (require.main === module) {
   main().catch(async (err) => {
