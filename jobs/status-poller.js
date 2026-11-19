@@ -263,6 +263,25 @@ async function main() {
     }
     const blocks = parseDayBlocks(rowData);
 
+    // Derive each block's own build date from the tab name's Monday (GRN DD.MM.YY) +
+    // the block's weekday — `parseDayBlocks` doesn't carry it, and weekly-setup.js
+    // annotates it only on its own in-memory copy. Without this the send-date mismatch
+    // guard below could never evaluate (found 19 Nov 2026 by diffing every board cell
+    // against its expectation and getting "no schedule entry" for all of them — the
+    // guard shipped inert earlier the same day).
+    const tabMonday = (() => {
+      const m = tabName.match(/^GRN (\d{2})\.(\d{2})\.(\d{2})$/);
+      return m ? new Date(`20${m[3]}-${m[2]}-${m[1]}T00:00:00Z`) : null;
+    })();
+    const DAY_OFFSET = { Monday: 0, Tuesday: 1, Wednesday: 2, Thursday: 3, Friday: 4 };
+    for (const b of blocks) {
+      if (tabMonday && DAY_OFFSET[b.dayName] !== undefined) {
+        const d = new Date(tabMonday);
+        d.setUTCDate(d.getUTCDate() + DAY_OFFSET[b.dayName]);
+        b.buildDateIso = d.toISOString().slice(0, 10);
+      }
+    }
+
     for (const block of blocks) {
       const statusField = block.fields.Status;
       const sendDateField = block.fields['Send date'];
