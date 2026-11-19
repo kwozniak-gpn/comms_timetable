@@ -129,7 +129,18 @@ async function findCurrentOrFutureGrnTabs() {
   const meta = await sheets.getSheetMeta(TIMETABLE_SPREADSHEET_ID);
   const today = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate()));
   const cutoff = new Date(today);
-  cutoff.setUTCDate(cutoff.getUTCDate() - 7); // keep last week's tab visible a bit past Monday, never further back
+  // WIDENED 19 Nov 2026 (was -7): a tab must stay in scope until ALL of its SENDS have
+  // happened, not until its build week feels old. GRN_BUILD_SCHEDULE's largest offset is
+  // the Friday block's NA CO at +7 days — a send staged by a tab can land as late as that
+  // tab's Monday + 11 (Fri = Mon+4, +7). The old 7-day window dropped a tab while several
+  // of its sends were still in the future, so any status change after that (a Bloomreach
+  // scenario built, a late approval) silently never reached the dashboard. Real incidents:
+  // NA CO 19/11 on GRN 09.11.26 (17 Nov, corrected by hand) and NA CO 20/11 on the same
+  // tab (19 Nov — scenario built, cell stuck on a stale status). 12 = 11 + one day of
+  // post-send settling. The 17 Nov "confirmed intentional scope" note in
+  // project_comms_status_dashboard_design described the -7 behavior, not a requirement —
+  // superseded by this.
+  cutoff.setUTCDate(cutoff.getUTCDate() - 12);
 
   return meta
     .filter((m) => /^GRN \d{2}\.\d{2}\.\d{2}$/.test(m.title))
