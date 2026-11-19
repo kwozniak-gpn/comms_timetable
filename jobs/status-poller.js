@@ -10,6 +10,7 @@ require('dotenv').config();
 const sheets = require('../lib/sheets_rest');
 const { getAccessToken } = require('../lib/gcp_access_token');
 const { parseDayBlocks, countryColumns, resolveCountryCode } = require('../lib/timetable_parser');
+const { GRN_BUILD_SCHEDULE, applyBfCmOverride } = require('../lib/bf_cm_overrides');
 const { postChatFlag, postChatError } = require('../lib/chat_notify');
 const { readMarker, writeMarker } = require('../lib/gcs_marker_rest');
 
@@ -75,8 +76,19 @@ async function resolveCols(source) {
 const NOTES_FLAG_PATTERNS = [
   { re: /AMBIGUOUS/i, label: 'unclear reply' },
   { re: /DEFECT REPORT/i, label: 'defect reported' },
-  { re: /NOT APPLIED/i, label: 'swap not applied' },
+  { re: /NOT APPLIED/i, label: 'request not applied' },
 ];
+
+// Notes columns on every source sheet are append-only history ('||'/'|'-joined entries,
+// newest last) — they never clear. REWRITTEN 19 Nov 2026 (second stale-🚨 incident, NA
+// 22.11: a resolved bottom-banner request kept the cell flagged for hours, someone
+// hand-annotated "swap applied" under it): a flag pattern only counts if it appears in
+// the LATEST entry. Anything appended after a flag means the automation or a human
+// acted again — the old flag is history, not the current state.
+function latestNotesEntry(notesVal) {
+  const parts = String(notesVal || '').split(/\s*\|\|\s*|\s+\|\s+/).filter((s) => s.trim());
+  return parts.length ? parts[parts.length - 1] : '';
+}
 
 function isLockedState(source, value) {
   if (source.kind === 'uk') return /ready for bloomreach/i.test(value || '');
@@ -111,12 +123,13 @@ async function getSheetId(tabName) {
 }
 
 async function fetchGrid(tabName) {
-  const token = await getAccessToken();
-  const res = await fetch(
-    `https://sheets.googleapis.com/v4/spreadsheets/${TIMETABLE_SPREADSHEET_ID}?ranges=${encodeURIComponent(`'${tabName}'!A1:AB400`)}&fields=sheets.data.rowData.values(formattedValue,hyperlink)`,
-    { headers: { Authorization: `Bearer ${token}` } },
-  );
-  if (!res.ok) throw new Error(`fetchGrid failed: ${res.status} ${await res.text()}`);
+  const res = await sheets.fetchWithRetry(async () => {
+    const token = await getAccessToken();
+    return fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${TIMETABLE_SPREADSHEET_ID}?ranges=${encodeURIComponent(`'${tabName}'!A1:AB400`)}&fields=sheets.data.rowData.values(formattedValue,hyperlink)`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+  }, `fetchGrid ${tabName}`);
   const { sheets: sheetsData } = await res.json();
   return sheetsData[0].data[0].rowData || [];
 }
@@ -188,6 +201,15 @@ function isNotStartedState(stateVal) {
   return /^pending$/i.test(stateVal.trim());
 }
 
+// REWRITTEN 19 Nov 2026 (Kasia: "still not working in sync with approvals and bloomreach
+// scenario... this needs a stable and permanent fix"). The old 3-state taxonomy had two
+// structural blind spots, both confirmed live that day:
+//   - a Locked/approved send with no scenario yet (or a FAILED scenario build — NA 11/20
+//     sat that way 15h, NA 11/21 indefinitely) rendered as plain "📝 In progress",
+//     indistinguishable from "nobody has approved anything";
+//   - a source row in "Build Failed — see Notes" (NA 11/26) ALSO rendered as
+//     "📝 In progress", hiding a real failure.
+// Approval is now a first-class state, and failure states surface as 🚨.
 function deriveStatus(source, cols, row) {
   if (!row) return null; // nothing to report yet — not an error, just not started
   const stateVal = row.values[(cols.state || cols.status) - 1] || '';
@@ -198,19 +220,26 @@ function deriveStatus(source, cols, row) {
   if (locked && scenarioLink) {
     return { emoji: '🔓', label: 'Scenario in Bloomreach' };
   }
-  // Real incident, 17 Nov 2026: Notes columns on every source sheet only ever append,
-  // never clear — a one-off "add not applied" or "DEFECT REPORT" entry from hours earlier
-  // stays in that cell's text forever, even after a later entry in the same string shows
-  // the issue was actually fixed. Checking NOTES_FLAG_PATTERNS unconditionally meant a
-  // send that was already approved and locked (UK's 19/11 and 20/11, NA CO's 19/11) kept
-  // showing a stale 🚨 for an issue a human had already resolved. A locked/approved send
-  // means a human has already signed off - by definition there is no longer an open
-  // blocker to flag, whatever old text happens to sit in Notes. Only check for a new 🚨
-  // while the send is still genuinely in flight (not yet locked).
-  if (!locked) {
-    for (const { re, label } of NOTES_FLAG_PATTERNS) {
-      if (re.test(notesVal)) return { emoji: '🚨', label };
+  if (locked) {
+    // Approved but the scenario isn't there. If the hook itself reported a failure,
+    // that's an actionable alert; otherwise the build fires seconds after lock, so
+    // "pending" should only ever show for one poll cycle — persisting longer is itself
+    // the visible signal something is wrong, instead of the old silent "In progress".
+    if (/Bloomreach build failed/i.test(latestNotesEntry(notesVal))) {
+      return { emoji: '🚨', label: 'scenario build failed' };
     }
+    return { emoji: '✅', label: 'Approved — scenario pending' };
+  }
+  // A real failure state on the source row (e.g. NA's "Build Failed — see Notes") must
+  // never display as routine progress.
+  if (/failed/i.test(stateVal)) {
+    return { emoji: '🚨', label: 'build failed' };
+  }
+  // 17 Nov 2026 rule (kept): only flag while genuinely in flight. 19 Nov narrowing: only
+  // the LATEST notes entry counts — see latestNotesEntry().
+  const lastEntry = latestNotesEntry(notesVal);
+  for (const { re, label } of NOTES_FLAG_PATTERNS) {
+    if (re.test(lastEntry)) return { emoji: '🚨', label };
   }
   if (stateVal && !isNotStartedState(stateVal)) return { emoji: '📝', label: 'In progress' };
   return null;
@@ -242,7 +271,8 @@ async function main() {
         continue;
       }
       const cols = countryColumns(block);
-      for (const { code: rawCode, colIndex } of cols) {
+      for (let ci = 0; ci < cols.length; ci++) {
+        const { code: rawCode, colIndex } = cols[ci];
         const code = resolveCountryCode(rawCode, block.dayName);
         const source = SOURCES[code];
         if (!source) {
@@ -254,6 +284,26 @@ async function main() {
         const targetIso = sendDateCellToIso(sendDateCell);
         if (!targetIso) continue; // Send date not filled in yet — nothing to check
 
+        // Send-date mismatch guard (added 19 Nov 2026). Real incident same day: a human
+        // hand-edited the Thursday block's DE Send date from the BF-override Fri 27.11
+        // back to DE's normal Mon 23.11 — no source row matches that date, so the poller
+        // went silent and a stale 🔓 sat under a wrong date for hours. Recompute what
+        // weekly-setup itself would have written (fixed day-offset + the BF/CM override
+        // table) and surface any divergence as a visible 🚨 + one Chat ping, instead of
+        // silently showing stale state. The cell is NOT auto-corrected — a mismatch can
+        // also mean a real schedule change the override table doesn't know yet; either
+        // way a human needs to see it, never a quiet wrong dashboard.
+        const schedEntry = (GRN_BUILD_SCHEDULE[block.dayName] || [])[ci];
+        let dateMismatch = null;
+        if (schedEntry && schedEntry.country === code && block.buildDateIso) {
+          const d = new Date(`${block.buildDateIso}T00:00:00Z`);
+          d.setUTCDate(d.getUTCDate() + schedEntry.offsetDays);
+          const expected = applyBfCmOverride(code, d.toISOString().slice(0, 10));
+          if (expected.dateIso !== targetIso) {
+            dateMismatch = { expectedIso: expected.dateIso, foundIso: targetIso };
+          }
+        }
+
         let rows, sourceCols;
         try {
           sourceCols = await resolveCols(source);
@@ -264,7 +314,14 @@ async function main() {
           continue;
         }
         const row = findSourceRow(rows, sourceCols, targetIso);
-        const status = deriveStatus(source, sourceCols, row);
+        let status = deriveStatus(source, sourceCols, row);
+        // A mismatched date whose own lookup found nothing is pure staleness — the 🚨
+        // replaces whatever old status is sitting there. If a row DOES match the cell's
+        // date (a legitimate reschedule the override table doesn't know), the row's own
+        // real status wins and the mismatch only goes to Chat via the 🚨 transition below.
+        if (dateMismatch && !row) {
+          status = { emoji: '🚨', label: 'send date mismatch' };
+        }
 
         const markerKey = `${block.dayName}:${colIndex}`;
         const prevEmoji = marker.cells[markerKey]?.emoji;
@@ -311,7 +368,7 @@ async function main() {
   console.log('status-poller: done.');
 }
 
-module.exports = { main, deriveStatus, isNotStartedState, getScenarioLink, findSourceRow, resolveCols, toIsoDate, sendDateCellToIso, findCurrentOrFutureGrnTabs };
+module.exports = { main, deriveStatus, isNotStartedState, getScenarioLink, findSourceRow, resolveCols, toIsoDate, sendDateCellToIso, findCurrentOrFutureGrnTabs, latestNotesEntry };
 
 if (require.main === module) {
   main().catch(async (err) => {
