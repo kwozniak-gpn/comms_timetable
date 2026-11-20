@@ -200,12 +200,17 @@ function getScenarioLink(cols, row) {
   return row.values[cols.scenarioLink - 1] || '';
 }
 
-// "Pending" means queued/not started yet — the build genuinely hasn't happened, so it
-// must show no status at all, same as no row existing yet. Confirmed 16 Nov 2026 (Kasia):
-// UK's 20/11 send showed "📝 In progress" a full day before its Tuesday build even
-// started, because the old fallback treated ANY non-empty state as "In progress".
+// "Draft"/"Pending" means queued/not started yet — the build genuinely hasn't happened,
+// so it must show no status at all, same as no row existing yet. Originally written
+// 16 Nov 2026 against "Pending" (Kasia: UK's 20/11 send showed "📝 In progress" a full
+// day before its Tuesday build even started) — but NA/UK/ROW's real initial/reset state
+// value is literally "Draft" everywhere (confirmed directly against all three repos'
+// tracking-sheet readers — none of them ever write "Pending"), so this check never
+// actually matched anything and the 16 Nov fix silently never worked. FIXED 20 Nov 2026
+// (real incident: DE and FR, both correctly reverted to Draft on 19 Nov, both still
+// showed "📝 In progress" on the dashboard — Kasia caught it, not a poller run).
 function isNotStartedState(stateVal) {
-  return /^pending$/i.test(stateVal.trim());
+  return /^(draft|pending)$/i.test(stateVal.trim());
 }
 
 // REWRITTEN 19 Nov 2026 (Kasia: "still not working in sync with approvals and bloomreach
