@@ -357,10 +357,10 @@ async function main() {
         const markerKey = `${block.dayName}:${colIndex}`;
         const prevEmoji = marker.cells[markerKey]?.emoji;
 
+        const range = `${sheets.quoteSheetTitle(tabName)}!${sheets.colLetter(colIndex + 1)}${statusField.rowNumber}`;
+        const existing = statusField.cells[colIndex]?.text;
         if (status) {
           const cellText = `${status.emoji} ${status.label}`;
-          const range = `${sheets.quoteSheetTitle(tabName)}!${sheets.colLetter(colIndex + 1)}${statusField.rowNumber}`;
-          const existing = statusField.cells[colIndex]?.text;
           if (existing !== cellText) {
             await sheets.writeRange(TIMETABLE_SPREADSHEET_ID, range, [[cellText]]);
             await sheets.setCellFormat(TIMETABLE_SPREADSHEET_ID, await getSheetId(tabName), statusField.rowNumber - 1, colIndex, {
@@ -373,6 +373,16 @@ async function main() {
             await postChatFlag(code, targetIso, status.label);
           }
           marker.cells[markerKey] = { emoji: status.emoji };
+          markerDirty = true;
+        } else if (existing) {
+          // FIXED 20 Nov 2026 (real incident: DE/FR reverted to Draft, deriveStatus()
+          // correctly started returning null again, but nothing ever cleared the stale
+          // "In progress" text an earlier poll had written — this branch never existed).
+          // writeRange with an empty string silently no-ops on this sheet (same gotcha as
+          // the GRN free-text note cells) — use the dedicated clear endpoint instead.
+          await sheets.clearRange(TIMETABLE_SPREADSHEET_ID, range);
+          console.log(`  ${tabName} ${code} (${block.dayName}) Status -> (cleared, not started)`);
+          delete marker.cells[markerKey];
           markerDirty = true;
         }
 
