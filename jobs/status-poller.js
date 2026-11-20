@@ -73,10 +73,17 @@ async function resolveCols(source) {
 }
 
 // Kasia's explicit spec: terse, no narrative, no quoted detail — 2-3 words, period.
+//
+// FIXED 20 Nov 2026 (real incident, NA 27/11): anchored to the start of the entry. Every
+// genuine tag is written as "TAG [<timestamp>] ..." (see reply_loop_orchestrator.js's
+// notesLines.push() calls for AMBIGUOUS/DEFECT REPORT/NOT APPLIED) — the old unanchored
+// /AMBIGUOUS/i matched the bare word anywhere in free text, so a note like "CC search
+// was ambiguous (many generic QVC BF offers...)" — a build-time offer-resolution comment
+// with no reply involved at all — wrongly showed as "unclear reply" on the dashboard.
 const NOTES_FLAG_PATTERNS = [
-  { re: /AMBIGUOUS/i, label: 'unclear reply' },
-  { re: /DEFECT REPORT/i, label: 'defect reported' },
-  { re: /NOT APPLIED/i, label: 'request not applied' },
+  { re: /^\s*AMBIGUOUS\s*\[/i, label: 'unclear reply' },
+  { re: /^\s*DEFECT REPORT\b/i, label: 'defect reported' },
+  { re: /^\s*NOT APPLIED\s*\[/i, label: 'request not applied' },
 ];
 
 // Notes columns on every source sheet are append-only history ('||'/'|'-joined entries,
